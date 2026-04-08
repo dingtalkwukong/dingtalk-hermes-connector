@@ -18,7 +18,6 @@ Configuration in config.yaml:
 """
 
 import asyncio
-import inspect
 import logging
 import os
 import time
@@ -134,11 +133,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                start_method = self._stream_client.start
-                if inspect.iscoroutinefunction(start_method):
-                    await start_method()
-                else:
-                    await asyncio.to_thread(start_method)
+                await self._stream_client.start()
             except asyncio.CancelledError:
                 return
             except Exception as e:
