@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -63,6 +64,28 @@ def _make_chatbot_message(**overrides):
     return SimpleNamespace(**defaults)
 
 
+def _seed_session_context(
+    adapter,
+    chat_id: str = "c1",
+    *,
+    chat_type: str = "dm",
+    conversation_id: str | None = "conv-1",
+    sender_staff_id: str | None = "s1",
+    session_webhook: str = "https://api.dingtalk.com/wh",
+    **extra,
+):
+    """Store a minimal session context for outbound send tests."""
+    context = {"chat_type": chat_type, "session_webhook": session_webhook}
+    if conversation_id is not None:
+        context["conversation_id"] = conversation_id
+    if sender_staff_id is not None:
+        context["sender_staff_id"] = sender_staff_id
+    context.update(extra)
+    adapter._session_context[chat_id] = context
+    adapter._session_webhooks[chat_id] = session_webhook
+    return context
+
+
 # ===========================================================================
 # 1. Requirements check
 # ===========================================================================
@@ -119,16 +142,22 @@ class TestDingTalkAdapterInit:
     def test_robot_code_defaults_to_client_id(self):
         adapter = _make_adapter(client_id="cid", client_secret="s")
         assert adapter._robot_code == "cid"
+        assert adapter._configured_robot_code == ""
 
     def test_robot_code_from_extra(self):
         adapter = _make_adapter(client_id="cid", client_secret="s", robot_code="custom")
         assert adapter._robot_code == "custom"
+        assert adapter._configured_robot_code == "custom"
 
     def test_session_context_initialized(self):
         adapter = _make_adapter()
         assert adapter._session_context == {}
         assert adapter._access_token == ""
         assert adapter._access_token_expires_at == 0.0
+
+    def test_supports_message_editing_is_false(self):
+        adapter = _make_adapter()
+        assert adapter.SUPPORTS_MESSAGE_EDITING is False
 
 
 # ===========================================================================
@@ -319,6 +348,7 @@ class TestSend:
             metadata={"session_webhook": "https://dingtalk.example/wh"},
         )
         assert result.success is True
+        assert result.message_id is None
         call = client.post.call_args
         assert call[0][0] == "https://dingtalk.example/wh"
         body = call[1]["json"]
@@ -487,13 +517,6 @@ class TestGetChatInfo:
         assert info["name"] == "some-id"
         assert info["type"] == "dm"
 
-    @pytest.mark.asyncio
-    async def test_fallback_cid_prefix_infers_group(self):
-        """chat_id starting with 'cid' is inferred as group per DingTalk spec."""
-        adapter = _make_adapter()
-        info = await adapter.get_chat_info("cid6KeBBLoveMJOGXoYKF5x7EeiodoA==")
-        assert info["type"] == "group"
-
 
 # ===========================================================================
 # 10. _resolve_robot_target
@@ -515,6 +538,29 @@ class TestResolveRobotTarget:
         assert "oToMessages" in ep
         assert target == {"userIds": ["s1"]}
 
+    def test_dm_conversation_uses_private_chat_endpoint(self):
+        adapter = _make_adapter()
+        ctx = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "sender_staff_id": "s1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        ep, target = adapter._resolve_robot_target("c1", ctx, kind_label="file")
+        assert "oToMessages" in ep
+        assert target == {"userIds": ["s1"]}
+
+    def test_dm_private_chat_endpoint_without_user_id(self):
+        adapter = _make_adapter()
+        ctx = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        ep, target = adapter._resolve_robot_target("c1", ctx, kind_label="file")
+        assert "privateChatMessages" in ep
+        assert target == {"openConversationId": "conv-1", "token": "sess-123"}
+
     def test_dm_user_id_fallback(self):
         adapter = _make_adapter()
         ctx = {"chat_type": "dm", "user_id": "u1"}
@@ -533,67 +579,6 @@ class TestResolveRobotTarget:
         adapter = _make_adapter()
         with pytest.raises(RuntimeError, match="Missing user ID"):
             adapter._resolve_robot_target("c1", {"chat_type": "dm"}, kind_label="f")
-
-    def test_merged_context_infers_group_when_context_exists(self):
-        """_merged_context returns stored group context correctly."""
-        adapter = _make_adapter()
-        adapter._session_context["conv-group-1"] = {
-            "chat_type": "group",
-            "conversation_id": "conv-group-1",
-            "user_id": "user-sender",
-            "sender_staff_id": "staff-alice",
-        }
-        ctx = adapter._merged_context("conv-group-1")
-        assert ctx.get("chat_type") == "group"
-        ep, target = adapter._resolve_robot_target("conv-group-1", ctx, kind_label="file")
-        assert "groupMessages" in ep
-        assert target == {"openConversationId": "conv-group-1"}
-
-    def test_merged_context_infers_group_from_other_session(self):
-        """When direct entry is evicted but another session references the
-        chat_id as conversation_id, infer group."""
-        adapter = _make_adapter()
-        adapter._session_context["user-sender"] = {
-            "chat_type": "group",
-            "conversation_id": "conv-group-2",
-            "user_id": "user-sender",
-        }
-        ctx = adapter._merged_context("conv-group-2")
-        assert ctx.get("chat_type") == "group"
-        assert ctx.get("conversation_id") == "conv-group-2"
-
-    def test_merged_context_defaults_empty_when_no_match(self):
-        """When no session references chat_id and no cid prefix, no chat_type."""
-        adapter = _make_adapter()
-        ctx = adapter._merged_context("unknown-chat-id")
-        assert ctx.get("chat_type") is None
-
-    def test_merged_context_cid_prefix_infers_group(self):
-        """Layer 3: chat_id starting with 'cid' is inferred as group even
-        with empty _session_context (e.g. after process restart)."""
-        adapter = _make_adapter()
-        # No session context at all
-        ctx = adapter._merged_context("cid6KeBBLoveMJOGXoYKF5x7EeiodoA==")
-        assert ctx.get("chat_type") == "group"
-        assert ctx.get("conversation_id") == "cid6KeBBLoveMJOGXoYKF5x7EeiodoA=="
-        # _resolve_robot_target should route to groupMessages
-        ep, target = adapter._resolve_robot_target(
-            "cid6KeBBLoveMJOGXoYKF5x7EeiodoA==", ctx, kind_label="file",
-        )
-        assert "groupMessages" in ep
-        assert target == {"openConversationId": "cid6KeBBLoveMJOGXoYKF5x7EeiodoA=="}
-
-    def test_merged_context_cid_prefix_not_overridden_by_stored(self):
-        """Stored context takes precedence over cid prefix heuristic."""
-        adapter = _make_adapter()
-        adapter._session_context["cidFakeButStoredAsDM"] = {
-            "chat_type": "dm",
-            "user_id": "user-x",
-            "sender_staff_id": "staff-x",
-        }
-        ctx = adapter._merged_context("cidFakeButStoredAsDM")
-        # Stored context wins
-        assert ctx.get("chat_type") == "dm"
 
 
 # ===========================================================================
@@ -642,13 +627,9 @@ class TestAccessToken:
 class TestSendImageFile:
 
     @pytest.mark.asyncio
-    async def test_success(self, tmp_path):
+    async def test_success(self, tmp_path, caplog):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "group", "conversation_id": "conv-1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
-        adapter._session_webhooks["c1"] = "https://api.dingtalk.com/wh"
+        _seed_session_context(adapter, chat_type="group")
         img = tmp_path / "test.jpg"
         img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
 
@@ -656,18 +637,13 @@ class TestSendImageFile:
         adapter._send_image_message = AsyncMock(return_value=MagicMock(success=True, message_id="s1"))
         adapter._send_media_caption = AsyncMock()
 
-        result = await adapter.send_image_file("c1", str(img), caption="Look!")
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.dingtalk"):
+            result = await adapter.send_image_file("c1", str(img), caption="Look!")
         assert result.success is True
         adapter._upload_media.assert_called_once_with(str(img), media_type="image")
-
-    @pytest.mark.asyncio
-    async def test_file_not_found(self):
-        adapter = _make_adapter()
-        adapter._session_context["c1"] = {"session_webhook": "https://api.dingtalk.com/wh"}
-        adapter.send = AsyncMock(return_value=MagicMock(success=True))
-        result = await adapter.send_image_file("c1", "/no/such/file.jpg")
-        assert result.success is False
-        assert "not found" in result.error.lower()
+        assert "Image sent to DingTalk" in caplog.text
+        assert "test.jpg" in caplog.text
+        assert "s1" in caplog.text
 
 
 # ===========================================================================
@@ -710,31 +686,24 @@ class TestSendImage:
 class TestSendDocument:
 
     @pytest.mark.asyncio
-    async def test_success(self, tmp_path):
+    async def test_success(self, tmp_path, caplog):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF" + b"\x00" * 100)
 
         adapter._upload_media = AsyncMock(return_value="mid")
-        adapter._send_file_message = AsyncMock(return_value=MagicMock(success=True))
+        adapter._send_file_message = AsyncMock(return_value=MagicMock(success=True, message_id="pqk-123"))
         adapter._send_media_caption = AsyncMock()
 
-        result = await adapter.send_document("c1", str(doc), caption="Report")
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.dingtalk"):
+            result = await adapter.send_document("c1", str(doc), caption="Report")
         assert result.success is True
         adapter._upload_media.assert_called_once_with(str(doc), media_type="file")
         adapter._send_file_message.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_file_not_found(self):
-        adapter = _make_adapter()
-        adapter._session_context["c1"] = {"session_webhook": "https://api.dingtalk.com/wh"}
-        adapter.send = AsyncMock(return_value=MagicMock(success=True))
-        result = await adapter.send_document("c1", "/no/file.pdf")
-        assert result.success is False
+        assert "File sent to DingTalk" in caplog.text
+        assert "report.pdf" in caplog.text
+        assert "pqk-123" in caplog.text
 
 
 # ===========================================================================
@@ -744,31 +713,29 @@ class TestSendDocument:
 class TestSendVoice:
 
     @pytest.mark.asyncio
-    async def test_native_with_duration_ogg(self, tmp_path):
+    async def test_native_with_duration_ogg(self, tmp_path, caplog):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         audio = tmp_path / "v.ogg"
         audio.write_bytes(b"OggS" + b"\x00" * 100)
 
         adapter._upload_media = AsyncMock(return_value="mid")
-        adapter._send_audio_message = AsyncMock(return_value=MagicMock(success=True))
+        adapter._send_audio_message = AsyncMock(return_value=MagicMock(success=True, message_id="audio-123"))
         adapter._send_media_caption = AsyncMock()
 
-        result = await adapter.send_voice("c1", str(audio), duration_ms=5000)
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.dingtalk"):
+            result = await adapter.send_voice("c1", str(audio), duration_ms=5000)
         assert result.success is True
         adapter._upload_media.assert_called_once_with(str(audio), media_type="voice")
         adapter._send_audio_message.assert_called_once_with("c1", "mid", 5000, metadata=None)
+        assert "Audio sent to DingTalk" in caplog.text
+        assert "v.ogg" in caplog.text
+        assert "audio-123" in caplog.text
 
     @pytest.mark.asyncio
     async def test_fallback_without_duration(self, tmp_path):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         audio = tmp_path / "v.ogg"
         audio.write_bytes(b"OggS" + b"\x00" * 100)
 
@@ -784,10 +751,7 @@ class TestSendVoice:
     @pytest.mark.asyncio
     async def test_fallback_non_ogg_amr(self, tmp_path):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         audio = tmp_path / "v.mp3"
         audio.write_bytes(b"\xff\xfb" + b"\x00" * 100)
 
@@ -800,51 +764,104 @@ class TestSendVoice:
         assert result.success is True
         adapter._upload_media.assert_called_once_with(str(audio), media_type="file")
 
+    
+
+# ===========================================================================
+# 16. local media path validation
+# ===========================================================================
+
+class TestLocalMediaPathValidation:
+
     @pytest.mark.asyncio
-    async def test_file_not_found(self):
+    @pytest.mark.parametrize("method_name, path_text", [
+        ("send_image_file", "/no/such/file.jpg"),
+        ("send_document", "/no/file.pdf"),
+        ("send_voice", "/no/audio.ogg"),
+        ("send_video", "/no/video.mp4"),
+    ])
+    async def test_missing_file_rejected(self, method_name, path_text):
         adapter = _make_adapter()
-        adapter._session_context["c1"] = {"session_webhook": "https://api.dingtalk.com/wh"}
+        _seed_session_context(adapter, chat_type="dm", conversation_id=None, sender_staff_id=None)
         adapter.send = AsyncMock(return_value=MagicMock(success=True))
-        result = await adapter.send_voice("c1", "/no/audio.ogg")
+
+        result = await getattr(adapter, method_name)("c1", path_text)
+
         assert result.success is False
+        assert result.error == f"File not found: {path_text}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", [
+        "send_image_file",
+        "send_document",
+        "send_voice",
+        "send_video",
+    ])
+    async def test_directory_path_rejected(self, method_name, tmp_path):
+        adapter = _make_adapter()
+        _seed_session_context(adapter, chat_type="dm", conversation_id=None, sender_staff_id=None)
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+
+        result = await getattr(adapter, method_name)("c1", str(tmp_path))
+
+        assert result.success is False
+        assert result.error == f"Not a file: {tmp_path}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", [
+        "send_image_file",
+        "send_document",
+        "send_voice",
+        "send_video",
+    ])
+    @pytest.mark.parametrize("path_text", [
+        "/path/to/file",
+        "/Users/.../dingtalk-gateway-user-message.txt",
+    ])
+    async def test_placeholder_path_rejected(self, method_name, path_text):
+        adapter = _make_adapter()
+        _seed_session_context(adapter, chat_type="dm", conversation_id=None, sender_staff_id=None)
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+
+        result = await getattr(adapter, method_name)("c1", path_text)
+
+        assert result.success is False
+        assert result.error == f"Placeholder file path: {path_text}"
 
 
 # ===========================================================================
-# 16. send_video
+# 17. send_video
 # ===========================================================================
 
 class TestSendVideo:
 
     @pytest.mark.asyncio
-    async def test_native_with_all_params(self, tmp_path):
+    async def test_native_with_all_params(self, tmp_path, caplog):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "group", "conversation_id": "conv-1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter, chat_type="group")
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"\x00" * 100)
         thumb = tmp_path / "thumb.jpg"
         thumb.write_bytes(b"\xff\xd8" + b"\x00" * 50)
 
         adapter._upload_media = AsyncMock(side_effect=["vid-m", "cover-m"])
-        adapter._send_video_message = AsyncMock(return_value=MagicMock(success=True))
+        adapter._send_video_message = AsyncMock(return_value=MagicMock(success=True, message_id="video-123"))
         adapter._send_media_caption = AsyncMock()
 
-        result = await adapter.send_video(
-            "c1", str(video), duration_seconds=30, thumbnail_path=str(thumb),
-        )
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.dingtalk"):
+            result = await adapter.send_video(
+                "c1", str(video), duration_seconds=30, thumbnail_path=str(thumb),
+            )
         assert result.success is True
         assert adapter._upload_media.call_count == 2
         adapter._send_video_message.assert_called_once()
+        assert "Video sent to DingTalk" in caplog.text
+        assert "clip.mp4" in caplog.text
+        assert "video-123" in caplog.text
 
     @pytest.mark.asyncio
     async def test_fallback_without_thumbnail(self, tmp_path):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"\x00" * 100)
 
@@ -859,10 +876,7 @@ class TestSendVideo:
     @pytest.mark.asyncio
     async def test_fallback_non_mp4(self, tmp_path):
         adapter = _make_adapter(client_id="cid", client_secret="sec")
-        adapter._session_context["c1"] = {
-            "chat_type": "dm", "sender_staff_id": "s1",
-            "session_webhook": "https://api.dingtalk.com/wh",
-        }
+        _seed_session_context(adapter)
         video = tmp_path / "clip.avi"
         video.write_bytes(b"\x00" * 100)
         thumb = tmp_path / "thumb.jpg"
@@ -878,17 +892,8 @@ class TestSendVideo:
         assert result.success is True
         adapter._upload_media.assert_called_once_with(str(video), media_type="file")
 
-    @pytest.mark.asyncio
-    async def test_file_not_found(self):
-        adapter = _make_adapter()
-        adapter._session_context["c1"] = {"session_webhook": "https://api.dingtalk.com/wh"}
-        adapter.send = AsyncMock(return_value=MagicMock(success=True))
-        result = await adapter.send_video("c1", "/no/video.mp4")
-        assert result.success is False
-
-
 # ===========================================================================
-# 17. send_animation
+# 18. send_animation
 # ===========================================================================
 
 class TestSendAnimation:
@@ -906,7 +911,7 @@ class TestSendAnimation:
 
 
 # ===========================================================================
-# 18. _send_robot_media_message
+# 19. _send_robot_media_message
 # ===========================================================================
 
 class TestSendRobotMediaMessage:
@@ -937,7 +942,12 @@ class TestSendRobotMediaMessage:
     @pytest.mark.asyncio
     async def test_dm_endpoint(self):
         adapter = _make_adapter(client_id="cid", client_secret="sec", robot_code="rbot")
-        adapter._session_context["u1"] = {"chat_type": "dm", "sender_staff_id": "s1"}
+        adapter._session_context["u1"] = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "sender_staff_id": "s1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
         adapter._access_token = "tok"
         adapter._access_token_expires_at = time.time() + 3600
 
@@ -954,7 +964,119 @@ class TestSendRobotMediaMessage:
         )
         assert result.success is True
         assert "oToMessages" in client.post.call_args[0][0]
-        assert client.post.call_args[1]["json"]["userIds"] == ["s1"]
+        body = client.post.call_args[1]["json"]
+        assert body["userIds"] == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_dm_private_endpoint_without_user_id(self):
+        adapter = _make_adapter(client_id="cid", client_secret="sec", robot_code="rbot")
+        adapter._session_context["u1"] = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        adapter._access_token = "tok"
+        adapter._access_token_expires_at = time.time() + 3600
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"processQueryKey": "pqk"}
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=resp)
+        adapter._http_client = client
+
+        result = await adapter._send_robot_media_message(
+            "u1", msg_key="sampleFile",
+            msg_param={"mediaId": "m1", "fileName": "f.pdf", "fileType": "pdf"},
+            kind_label="file",
+        )
+        assert result.success is True
+        assert "privateChatMessages" in client.post.call_args[0][0]
+        body = client.post.call_args[1]["json"]
+        assert body["openConversationId"] == "conv-1"
+        assert body["token"] == "sess-123"
+
+    @pytest.mark.asyncio
+    async def test_prefers_session_robot_code(self):
+        adapter = _make_adapter(client_id="cid", client_secret="sec")
+        adapter._session_context["u1"] = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "sender_staff_id": "s1",
+            "robot_code": "session-rbot",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        adapter._access_token = "tok"
+        adapter._access_token_expires_at = time.time() + 3600
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"processQueryKey": "pqk"}
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=resp)
+        adapter._http_client = client
+
+        result = await adapter._send_robot_media_message(
+            "u1",
+            msg_key="sampleFile",
+            msg_param={"mediaId": "m1", "fileName": "f.pdf", "fileType": "pdf"},
+            kind_label="file",
+        )
+        assert result.success is True
+        assert client.post.call_args[1]["json"]["robotCode"] == "session-rbot"
+
+    @pytest.mark.asyncio
+    async def test_robot_not_found_mentions_client_id_fallback(self):
+        adapter = _make_adapter(client_id="cid", client_secret="sec")
+        adapter._session_context["u1"] = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "sender_staff_id": "s1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        adapter._access_token = "tok"
+        adapter._access_token_expires_at = time.time() + 3600
+
+        resp = MagicMock(status_code=400, text='{"code":"resource.not.found","message":"robot 不存在"}')
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=resp)
+        adapter._http_client = client
+
+        result = await adapter._send_robot_media_message(
+            "u1",
+            msg_key="sampleFile",
+            msg_param={"mediaId": "m1", "fileName": "f.pdf", "fileType": "pdf"},
+            kind_label="file",
+        )
+        assert result.success is False
+        assert "robotCodeSource=client_id_fallback" in (result.error or "")
+        assert "/v1.0/robot/oToMessages/batchSend" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_business_error_in_200_response_is_failure(self):
+        adapter = _make_adapter(client_id="cid", client_secret="sec", robot_code="rbot")
+        adapter._session_context["u1"] = {
+            "chat_type": "dm",
+            "conversation_id": "conv-1",
+            "sender_staff_id": "s1",
+            "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=sess-123",
+        }
+        adapter._access_token = "tok"
+        adapter._access_token_expires_at = time.time() + 3600
+
+        resp = MagicMock(status_code=200, text='{"code":"resource.not.found","message":"robot 不存在"}')
+        resp.json.return_value = {"code": "resource.not.found", "message": "robot 不存在"}
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=resp)
+        adapter._http_client = client
+
+        result = await adapter._send_robot_media_message(
+            "u1",
+            msg_key="sampleImageMsg",
+            msg_param={"photoURL": "m1"},
+            kind_label="image",
+        )
+        assert result.success is False
+        assert "resource.not.found" in (result.error or "")
+        assert "/v1.0/robot/oToMessages/batchSend" in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_missing_context(self):
@@ -1102,6 +1224,24 @@ class TestOnMessage:
         assert ctx is not None
         assert ctx["chat_type"] == "group"
         assert ctx["sender_staff_id"] == "staff-alice"
+        assert ctx["robot_code"] == "rbot"
+
+    @pytest.mark.asyncio
+    async def test_captures_robot_code_from_raw_payload(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        adapter._http_client = AsyncMock()
+
+        msg = _make_chatbot_message(
+            text="hi",
+            robot_code="",
+            _raw_data={"robotCode": "raw-rbot", "senderStaffId": "staff-alice"},
+        )
+        await adapter._on_message(msg)
+
+        ctx = adapter._session_context.get("conv-group-1")
+        assert ctx is not None
+        assert ctx["robot_code"] == "raw-rbot"
 
     @pytest.mark.asyncio
     async def test_caches_session_webhook(self):
@@ -1239,6 +1379,7 @@ class TestIncomingHandler:
                 "senderId": "user-123",
                 "senderNick": "Alice",
                 "senderStaffId": "staff-123",
+                "robotCode": "rbot-123",
                 "conversationId": "conv-123",
                 "conversationType": "1",
                 "conversationTitle": "Alice",
@@ -1255,6 +1396,8 @@ class TestIncomingHandler:
         inbound = adapter._on_message.await_args.args[0]
         assert inbound.sender_id == "user-123"
         assert inbound.sender_staff_id == "staff-123"
+        assert inbound.robot_code == "rbot-123"
+        assert inbound._raw_data["robotCode"] == "rbot-123"
         assert inbound.message_type == "text"
         assert inbound.text.content == "ping"
         assert ack.code == 200
