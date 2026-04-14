@@ -6,9 +6,6 @@ Replace ~/.hermes/hermes-agent/gateway/platforms/dingtalk.py with this file and 
 
 DingTalk platform adapter for hermes
 Supports:
-- Stream-mode WebSocket long connection via dingtalk-stream SDK
-- Direct-message text receive/send with session context
-- Inbound image/file/audio/video caching
-- Outbound image via media upload + native image message (mediaId)
-- Outbound document/file via Wiki workspace upload
-- OpenAPI integration (access token, union ID resolution)
+- Outbound rich media (image, voice, video, file) sent via DingTalk Robot OpenAPI.
+- Inbound media (image, audio, file) downloaded and cached for agent consumption.
+
